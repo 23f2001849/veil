@@ -33,3 +33,7 @@ android/local.properties
 android/.idea
 *.apk
 .DS_Store
+
+android/keystore.properties
+*.keystore
+*.jks

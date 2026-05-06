@@ -7,7 +7,7 @@ import { sha256, hexToBytes, bytesToHex } from './crypto.js';
 const MAGIC = new TextEncoder().encode('VEIL');
 const VERSION = 0x01;
 const HEADER_SIZE = 4 + 1 + 8 + 4 + 4 + 16 + 2; // = 39 bytes
-const PAYLOAD_MAX = 2200;
+const PAYLOAD_MAX = 800;
 
 // Encode the entire pad as an array of chunks ready for QR rendering.
 // padIdHex is 16 hex chars (8 bytes). padBytes is Uint8Array.
@@ -51,15 +51,13 @@ export async function encodePadAsChunks(padIdHex, padBytes) {
 // Render a single chunk to a canvas as a QR code.
 // chunkBytes: Uint8Array. canvas: HTMLCanvasElement.
 export async function renderChunkToCanvas(chunkBytes, canvas, sizePx) {
-  // qrcode npm library accepts Uint8Array via "byte" segment type.
-  // Error correction level M = 15% recovery, balances density vs robustness.
   await QRCode.toCanvas(canvas, [{ data: chunkBytes, mode: 'byte' }], {
-    errorCorrectionLevel: 'M',
-    margin: 2,
+    errorCorrectionLevel: 'L',  // L = 7% recovery — smaller, denser data isn't a worry at 800B
+    margin: 4,                  // wider quiet zone helps phone-to-phone scanning
     width: sizePx,
     color: {
-      dark: '#e8dcca',  // veil --fg
-      light: '#0a0908'  // veil --bg
+      dark: '#000000',          // standard dark-on-light, the polarity all decoders expect
+      light: '#ffffff'
     }
   });
 }

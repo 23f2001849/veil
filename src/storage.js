@@ -175,6 +175,48 @@ export async function deletePad(id) {
   });
 }
 
+export async function importPad({ id, name, padBytes, passphrase }) {
+  const existing = await listPads();
+  if (existing.includes(id)) {
+    throw new Error(`Pad with id ${id} already exists on this device. Refusing to overwrite — would desynchronize offsets with the sender.`);
+  }
+
+  await ensureDir();
+
+  const salt = randomBytes(16);
+  const key = await deriveKey(passphrase, salt);
+  const { ciphertext, iv } = await aesEncrypt(key, padBytes);
+
+  const metadata = {
+    id,
+    name,
+    size: padBytes.length,
+    offset: 0,
+    created: new Date().toISOString(),
+    role: 'imported'
+  };
+
+  const fileContent = JSON.stringify({
+    version: 1,
+    salt: bytesToBase64(salt),
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(ciphertext),
+    metadata
+  });
+
+  await Filesystem.writeFile({
+    path: `${PAD_DIR}/${id}.veil`,
+    data: fileContent,
+    directory: Directory.Documents,
+    encoding: Encoding.UTF8
+  });
+
+  padBytes.fill(0);
+
+  await addToIndex(id);
+  return metadata;
+}
+
 // Decrypt and return raw pad bytes for export. Caller MUST wipe when done.
 // This intentionally does NOT advance any offset — exporting is read-only.
 // The full pad is exported regardless of current offset, because the receiver
