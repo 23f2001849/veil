@@ -111,6 +111,12 @@ export function xorBytes(a, b) {
 // during GC. This zeros the visible buffer; the underlying memory hygiene
 // is the platform's responsibility. Surfaced in About dialog for honesty.
 export function wipeBytes(bytes) {
-  crypto.getRandomValues(bytes); // overwrite with random first
-  bytes.fill(0);                  // then zero
+  // Overwrite with random first, then zero. Same 64 KB chunking constraint
+  // as randomBytes — getRandomValues caps at 65,536 bytes per call.
+  const CHUNK = 65536;
+  for (let offset = 0; offset < bytes.length; offset += CHUNK) {
+    const view = bytes.subarray(offset, Math.min(offset + CHUNK, bytes.length));
+    crypto.getRandomValues(view);
+  }
+  bytes.fill(0);
 }
