@@ -174,3 +174,18 @@ export async function deletePad(id) {
     value: JSON.stringify(ids.filter(x => x !== id))
   });
 }
+
+// Decrypt and return raw pad bytes for export. Caller MUST wipe when done.
+// This intentionally does NOT advance any offset — exporting is read-only.
+// The full pad is exported regardless of current offset, because the receiver
+// needs the complete pad to be in sync with the sender.
+//
+// IMPORTANT: in the current single-pad-export model, this is called BEFORE
+// any messages have been encrypted (offset still 0). If offset > 0, exporting
+// the pad to a new device would still work but the new device's offset starts
+// at 0 — the two would be out of sync. Day 4 receiver enforces "fresh import
+// only" by refusing to overwrite an existing pad with the same id.
+export async function exportPadBytes(id, passphrase) {
+  const { padBytes, metadata, parsed } = await unlockPad(id, passphrase);
+  return { padBytes, metadata, parsed };
+}

@@ -1,4 +1,3 @@
-import './style.css';
 import {
   randomBytes, deriveKey, aesEncrypt, aesDecrypt, sha256,
   bytesToBase64, base64ToBytes, bytesToHex, hexToBytes,
@@ -6,16 +5,17 @@ import {
 } from './crypto.js';
 import {
   createPad, listPads, readPadMetadata, unlockPad,
-  commitPadAdvance, deletePad
+  commitPadAdvance, deletePad, exportPadBytes
 } from './storage.js';
 import { Preferences } from '@capacitor/preferences';
+import { encodePadAsChunks, renderChunkToCanvas } from './qr.js';
 
 // ----------------------------------------------------------------------------
 // App state
 // ----------------------------------------------------------------------------
 // We keep a single module-level state object. No framework. Re-render on change.
 const state = {
-  screen: 'loading',     // loading | setup | unlock | library | create | pad
+  screen: 'loading',     // loading | setup | unlock | library | create | pad | export  
   passphrase: null,      // held in memory only while unlocked
   selectedPadId: null,
   error: null,
@@ -33,6 +33,7 @@ function render() {
     case 'library': renderLibrary(); break;
     case 'create': renderCreate(); break;
     case 'pad': renderPad(); break;
+    case 'export': renderExport(); break;
     default: renderLoading();
   }
 }
@@ -324,6 +325,7 @@ async function renderPad() {
       <div id="dec-out" style="margin-top:1rem"></div>
 
       <div class="actions" style="margin-top:2.5rem">
+        <button id="exp" class="full secondary">Export to other device (QR)</button>
         <button id="del" class="full danger">Delete pad</button>
       </div>
       <div id="err" class="error"></div>
@@ -419,6 +421,12 @@ async function renderPad() {
     }
   };
 
+  document.getElementById('exp').onclick = () => {
+    if (meta.offset > 0) {
+      if (!confirm(`This pad already has ${meta.offset} bytes consumed. Exporting now will desynchronize with the recipient. Continue anyway?`)) return;
+    }
+    navigate('export', { padId: id });
+  };
   document.getElementById('del').onclick = async () => {
     if (!confirm(`Delete "${meta.name}" permanently? The pad bytes are gone forever.`)) return;
     try {
@@ -428,6 +436,145 @@ async function renderPad() {
       err.textContent = `Delete failed: ${e.message}`;
     }
   };
+}
+
+// ----------------------------------------------------------------------------
+// Export screen: animated QR sequence broadcasting the pad to a partner device.
+// ----------------------------------------------------------------------------
+async function renderExport() {
+  const id = state.selectedPadId;
+  let meta;
+  try {
+    meta = await readPadMetadata(id);
+  } catch (e) {
+    root.innerHTML = `<div class="screen"><div class="error">Pad unreadable: ${escapeHtml(e.message)}</div></div>`;
+    return;
+  }
+
+  // Initial UI: confirm + start.
+  root.innerHTML = `
+    <div class="screen">
+      <div class="back" id="back">← Cancel</div>
+      <p class="eyebrow">Export</p>
+      <h1 class="title">${escapeHtml(meta.name)}</h1>
+      <p class="subtitle">Broadcast the pad to the recipient device as a sequence of QR codes. Their camera will scan them in order. Hold the phones still and aligned.</p>
+      <div class="hint" style="margin-bottom:1.5rem">${formatBytes(meta.size)} of pad bytes · about ${Math.ceil(meta.size / 2200)} QR codes · ${(Math.ceil(meta.size / 2200) / 2).toFixed(0)} seconds at 2 codes/sec</div>
+      <button id="start" class="full">Start broadcasting</button>
+      <div id="err" class="error"></div>
+      <div id="busy" class="spinner"></div>
+    </div>`;
+
+  document.getElementById('back').onclick = () => navigate('pad', { padId: id });
+  const err = document.getElementById('err');
+  const busy = document.getElementById('busy');
+
+  document.getElementById('start').onclick = async () => {
+    busy.textContent = 'Decrypting pad and chunking…';
+    document.getElementById('start').disabled = true;
+    let padBytes;
+    let chunks;
+    try {
+      const exp = await exportPadBytes(id, state.passphrase);
+      padBytes = exp.padBytes;
+      chunks = await encodePadAsChunks(meta.id, padBytes);
+    } catch (e) {
+      err.textContent = `Export prep failed: ${e.message}`;
+      busy.textContent = '';
+      document.getElementById('start').disabled = false;
+      return;
+    }
+
+    // Render the broadcasting UI.
+    root.innerHTML = `
+      <div class="screen">
+        <div class="back" id="back2">← Stop</div>
+        <p class="eyebrow" id="eyebrow">Broadcasting · 0 / ${chunks.length}</p>
+        <h1 class="title" style="font-size:1.5rem">${escapeHtml(meta.name)}</h1>
+        <div style="display:flex;justify-content:center;margin:1.5rem 0">
+          <canvas id="qr" width="320" height="320" style="background:var(--bg);border:1px solid var(--border);border-radius:4px"></canvas>
+        </div>
+        <div class="bar"><div id="prog" style="width:0%"></div></div>
+        <div class="actions">
+          <div class="row">
+            <button id="pause" class="secondary">Pause</button>
+            <button id="slow" class="secondary">Half speed</button>
+          </div>
+        </div>
+        <div class="hint" id="rateHint" style="margin-top:1rem">2 codes / second</div>
+      </div>`;
+
+    const canvas = document.getElementById('qr');
+    const eyebrow = document.getElementById('eyebrow');
+    const prog = document.getElementById('prog');
+    const pauseBtn = document.getElementById('pause');
+    const slowBtn = document.getElementById('slow');
+    const rateHint = document.getElementById('rateHint');
+    document.getElementById('back2').onclick = () => {
+      stopped = true;
+      // Wipe pad bytes immediately on cancel
+      if (padBytes) wipeBytes(padBytes);
+      navigate('pad', { padId: id });
+    };
+
+    let i = 0;
+    let intervalMs = 500; // 2 per second
+    let paused = false;
+    let stopped = false;
+
+    pauseBtn.onclick = () => {
+      paused = !paused;
+      pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+    };
+    slowBtn.onclick = () => {
+      intervalMs = intervalMs === 500 ? 1000 : 500;
+      slowBtn.textContent = intervalMs === 500 ? 'Half speed' : 'Full speed';
+      rateHint.textContent = intervalMs === 500 ? '2 codes / second' : '1 code / second';
+    };
+
+    // Pre-render first frame
+    await renderChunkToCanvas(chunks[0], canvas, 320);
+    eyebrow.textContent = `Broadcasting · 1 / ${chunks.length}`;
+    prog.style.width = `${(1 / chunks.length) * 100}%`;
+    i = 1;
+
+    while (i < chunks.length && !stopped) {
+      await sleep(intervalMs);
+      if (stopped) break;
+      if (paused) { i--; continue; } // re-loop without advancing
+      try {
+        await renderChunkToCanvas(chunks[i], canvas, 320);
+        eyebrow.textContent = `Broadcasting · ${i + 1} / ${chunks.length}`;
+        prog.style.width = `${((i + 1) / chunks.length) * 100}%`;
+      } catch (e) {
+        eyebrow.textContent = `Render failed at chunk ${i}: ${e.message}`;
+        break;
+      }
+      i++;
+    }
+
+    if (!stopped && i >= chunks.length) {
+      eyebrow.textContent = `Broadcast complete · ${chunks.length} / ${chunks.length}`;
+      // Loop back to the start so a slow scanner can still complete.
+      // The receiver knows total_chunks and ignores duplicates.
+      eyebrow.textContent += ' · looping';
+      i = 0;
+      while (!stopped) {
+        await sleep(intervalMs);
+        if (stopped) break;
+        if (paused) continue;
+        await renderChunkToCanvas(chunks[i], canvas, 320);
+        eyebrow.textContent = `Looping · ${i + 1} / ${chunks.length}`;
+        i = (i + 1) % chunks.length;
+      }
+    }
+
+    // Wipe on exit
+    if (padBytes) wipeBytes(padBytes);
+  };
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 // ----------------------------------------------------------------------------
